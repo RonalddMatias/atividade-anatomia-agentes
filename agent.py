@@ -9,8 +9,18 @@ from typing import Any, Dict, List, Tuple
 
 load_dotenv()
 
-openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+openai_client = OpenAI(
+    api_key=os.environ["GROQ_API_KEY"],
+    base_url="https://api.groq.com/openai/v1",
+)
 
+# A frase abaixo, a partir de "IMPORTANT: do not use...", NÃO estava no agent.py
+# original. Foi adicionada depois de confirmar, empiricamente (ver ANALISE.md),
+# que openai/gpt-oss-120b via Groq tenta usar seu tool calling nativo sempre que
+# a tarefa exige uma tool call, e a Groq rejeita isso com erro 400 antes de
+# qualquer texto voltar, o que impedia o agente de sair do primeiro turno.
+# Reforçar essa instrução reduz (mas não elimina) esse comportamento. É uma
+# mudança de escopo em relação ao enunciado, registrada aqui e na análise.
 SYSTEM_PROMPT = """
 You are a coding assistant whose goal it is to help us solve coding tasks.
 You have access to a series of tools you can execute. Hear are the tools you can execute:
@@ -20,6 +30,11 @@ You have access to a series of tools you can execute. Hear are the tools you can
 When you want to use a tool, reply with exactly one line in the format: 'tool: TOOL_NAME({{JSON_ARGS}})' and nothing else.
 Use compact single-line JSON with double quotes. After receiving a tool_result(...) message, continue the task.
 If no tool is needed, respond normally.
+
+IMPORTANT: do not use any native function calling / tool_calls mechanism of the API.
+The ONLY valid way to invoke a tool is writing a plain text line in the exact format
+above. Never fabricate or guess what a tool would return, always actually invoke it
+using that text format and wait for the real tool_result(...) message.
 """
 
 
@@ -143,20 +158,111 @@ def extract_tool_invocations(text: str) -> List[Tuple[str, Dict[str, Any]]]:
             continue
     return invocations
 
+TRACE_FILE_PATH = Path(__file__).resolve().parent / "trace.md"
+MAX_OBSERVATION_CHARS = 2000
+
+def start_trace():
+    """Zera trace.md no início de cada execução, para o arquivo sempre refletir só a última run."""
+    TRACE_FILE_PATH.write_text("# Trace da execução\n", encoding="utf-8")
+
+def log_trace(block: str):
+    """Imprime no terminal e grava o mesmo bloco em trace.md, para termos as duas formas pedidas no README."""
+    print(block)
+    with open(TRACE_FILE_PATH, "a", encoding="utf-8") as f:
+        f.write(block + "\n")
+
+def truncate(text: str) -> str:
+    """Evita que uma Observation gigante (ex.: list_files em '.') deixe o trace ilegível."""
+    if len(text) <= MAX_OBSERVATION_CHARS:
+        return text
+    omitted = len(text) - MAX_OBSERVATION_CHARS
+    return text[:MAX_OBSERVATION_CHARS] + f"\n[...truncado, {omitted} caracteres omitidos...]"
+
+def split_thought_and_tool_lines(text: str):
+    """
+    Separa a resposta bruta do LLM em (thought, tool_lines, trailing):
+    - thought: texto antes da primeira linha 'tool: ...'. Se não houver nenhuma,
+      a resposta inteira é o thought (é a resposta final da tarefa), regra tirada
+      literalmente do README: "o texto do modelo antes da chamada de tool ou da
+      resposta final".
+    - tool_lines: as linhas cruas que começam com 'tool:', na ordem em que aparecem
+      no texto (o prompt pede exatamente uma, mas o modelo nem sempre obedece).
+    - trailing: texto que sobra depois da ÚLTIMA linha 'tool:'. O formato pedido no
+      prompt não permite nada depois da tool call, então texto aqui é sinal de
+      resposta fora do formato esperado.
+    """
+    lines = text.splitlines()
+    tool_idxs = [i for i, line in enumerate(lines) if line.strip().startswith("tool:")]
+    if not tool_idxs:
+        return text.strip(), [], ""
+    thought = "\n".join(lines[:tool_idxs[0]]).strip()
+    tool_lines = [lines[i].strip() for i in tool_idxs]
+    trailing = "\n".join(lines[tool_idxs[-1] + 1:]).strip()
+    return thought, tool_lines, trailing
+
 def execute_llm_call(conversation: List[Dict[str, str]]):
     response = openai_client.chat.completions.create(
-        model="gpt-5",
+        model="openai/gpt-oss-120b",
         messages=conversation,
-        max_completion_tokens=2000
+        max_tokens=2000
     )
-    return response.choices[0].message.content
+    message = response.choices[0].message
+    # Descoberta empírica (ver ANALISE.md): a Groq devolve, pra esse modelo, um
+    # campo `reasoning` separado de `content` (canal de raciocínio interno vs.
+    # resposta final). O código original só lia `content`, só que boa parte das
+    # vezes é justamente em `reasoning` que o modelo escreve a linha
+    # "tool: nome({...})" pedida no prompt, deixando `content` vazio. Juntamos os
+    # dois pra não descartar texto que o modelo de fato gerou.
+    reasoning = getattr(message, "reasoning", None) or ""
+    content = message.content or ""
+    return (reasoning + ("\n" + content if content else "")).strip()
+
+MAX_LLM_CALL_ATTEMPTS = 3
+
+def execute_llm_call_with_retry(conversation: List[Dict[str, str]]):
+    """
+    Alguns modelos (ex.: openai/gpt-oss-120b via Groq) tentam responder usando o
+    canal de tool calling nativo da API mesmo quando instruídos, só via prompt, a
+    responder em texto puro, e a API rejeita isso com um erro 400 antes de
+    qualquer texto voltar pra gente. Isso não é uma falha do nosso parser (o texto
+    nem chega a existir), então não tem "tool: ..." pra extract_tool_invocations
+    processar. Aqui só evitamos que isso derrube o programa inteiro com um
+    traceback ilegível: tentamos de novo (a amostragem é probabilística) e, se
+    todas as tentativas falharem, devolvemos None para o chamador decidir como
+    encerrar. Toda tentativa falha é logada no trace, nada fica escondido.
+    """
+    last_error = None
+    for attempt in range(1, MAX_LLM_CALL_ATTEMPTS + 1):
+        try:
+            return execute_llm_call(conversation), None
+        except Exception as exc:
+            last_error = exc
+            msg = (
+                f"\n[FALHA] tentativa {attempt}/{MAX_LLM_CALL_ATTEMPTS} de chamada ao "
+                f"LLM falhou antes de retornar texto: {exc}"
+            )
+            # A Groq às vezes devolve, dentro do próprio erro, o raciocínio interno
+            # que o modelo gerou antes de travar (campo "failed_generation"). Não é
+            # uma resposta válida, nunca vira uma Action de verdade, mas é texto de
+            # Thought real que a API deixou vazar, então vale capturar em vez de
+            # descartar junto com o erro.
+            failed_generation = getattr(exc, "body", None)
+            if isinstance(failed_generation, dict) and failed_generation.get("failed_generation"):
+                msg += (
+                    "\n[THOUGHT PARCIAL VAZADO PELO ERRO] "
+                    f"{failed_generation['failed_generation']!r}"
+                )
+            log_trace(msg)
+    return None, last_error
 
 def run_coding_agent_loop():
     print(get_full_system_prompt())
+    start_trace()
     conversation = [{
         "role": "system",
         "content": get_full_system_prompt()
     }]
+    iteration = 0
     while True:
         try:
             user_input = input(f"{YOU_COLOR}You:{RESET_COLOR}:")
@@ -166,16 +272,65 @@ def run_coding_agent_loop():
             "role": "user",
             "content": user_input.strip()
         })
+        # Este while interno É o loop do agente: uma volta = uma chamada ao LLM.
+        # Ele só para quando o próprio modelo responde sem nenhuma tool call,
+        # não existe, hoje, nenhuma verificação externa que confirme se a tarefa
+        # foi de fato concluída antes de parar (ausência de guardrail).
         while True:
-            assistant_response = execute_llm_call(conversation)
+            iteration += 1
+            assistant_response, error = execute_llm_call_with_retry(conversation)
+            if assistant_response is None:
+                log_trace(
+                    f"\n[FALHA IRRECUPERAVEL] todas as {MAX_LLM_CALL_ATTEMPTS} tentativas de "
+                    f"chamada ao LLM falharam nesta iteracao, execucao encerrada sem resposta "
+                    f"do modelo. Ultimo erro: {error}"
+                )
+                print(f"{ASSISTANT_COLOR}Assistant:{RESET_COLOR}: [falha irrecuperável, ver trace.md]")
+                return
+            thought, tool_lines, trailing = split_thought_and_tool_lines(assistant_response)
             tool_invocations = extract_tool_invocations(assistant_response)
+
+            block = [f"\n## Iteracao {iteration}", "\n**Thought:**", thought or "_(vazio)_"]
+
+            # Falha de parsing tipo 1: a resposta tem "tool:" mas nem uma linha nesse
+            # formato foi reconhecida por extract_tool_invocations (ex.: o modelo
+            # escreveu "tool:" no meio de uma frase, e não como início de linha).
+            if not tool_lines and "tool:" in assistant_response:
+                block.append(
+                    "\n[PARSING] a resposta contém a palavra 'tool:' mas nenhuma linha "
+                    "no formato esperado foi encontrada, tratada como resposta final."
+                )
+
+            # Falha de parsing tipo 2: havia N linhas 'tool: ...' reconhecíveis, mas
+            # extract_tool_invocations só conseguiu extrair M < N (ex.: JSON quebrado
+            # em alguma delas). Isso descarta silenciosamente uma ação que o modelo
+            # pretendia executar.
+            if tool_lines and len(tool_lines) != len(tool_invocations):
+                block.append(
+                    f"\n[PARSING] {len(tool_lines)} linha(s) 'tool:' encontradas no texto, "
+                    f"mas apenas {len(tool_invocations)} foram reconhecidas como chamadas "
+                    "válidas, pelo menos uma foi descartada silenciosamente pelo parser."
+                )
+
+            # Texto sobrando depois da última tool call: fora do formato pedido no prompt.
+            if trailing:
+                block.append(
+                    f"\n[PARSING] texto encontrado após a última linha 'tool:' (ignorado "
+                    f"pelo parser): {trailing!r}"
+                )
+
             if not tool_invocations:
+                block.append("\n_(sem tool call, resposta tratada como final da tarefa)_")
+                log_trace("\n".join(block))
                 print(f"{ASSISTANT_COLOR}Assistant:{RESET_COLOR}: {assistant_response}")
                 conversation.append({
                     "role": "assistant",
                     "content": assistant_response
                 })
                 break
+
+            log_trace("\n".join(block))
+
             for name, args in tool_invocations:
                 tool = TOOL_REGISTRY[name]
                 resp = ""
@@ -188,9 +343,18 @@ def run_coding_agent_loop():
                     resp = tool(args.get("path", "."),
                                 args.get("old_str", ""),
                                 args.get("new_str", ""))
+                # É exatamente esta string que volta para a conversa (contexto) e que
+                # o LLM vai ler na próxima chamada, por isso o log mostra o mesmo
+                # texto que é appendado abaixo, e não uma versão só "bonitinha" dele.
+                result_str = f"tool_result({json.dumps(resp)})"
+                action_block = (
+                    f"\n**Action:** `tool: {name}({json.dumps(args)})`"
+                    f"\n\n**Observation:**\n```\n{truncate(result_str)}\n```"
+                )
+                log_trace(action_block)
                 conversation.append({
                     "role": "user",
-                    "content": f"tool_result({json.dumps(resp)})"
+                    "content": result_str
                 })
 
 
