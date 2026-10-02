@@ -14,27 +14,25 @@ openai_client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
 )
 
-# A frase abaixo, a partir de "IMPORTANT: do not use...", NÃO estava no agent.py
-# original. Foi adicionada depois de confirmar, empiricamente (ver ANALISE.md),
-# que openai/gpt-oss-120b via Groq tenta usar seu tool calling nativo sempre que
-# a tarefa exige uma tool call, e a Groq rejeita isso com erro 400 antes de
-# qualquer texto voltar, o que impedia o agente de sair do primeiro turno.
-# Reforçar essa instrução reduz (mas não elimina) esse comportamento. É uma
-# mudança de escopo em relação ao enunciado, registrada aqui e na análise.
+
 SYSTEM_PROMPT = """
 You are a coding assistant whose goal it is to help us solve coding tasks.
-You have access to a series of tools you can execute. Hear are the tools you can execute:
+You can perform actions by emitting a single command line in exactly this format, and nothing else on that line:
+
+tool: NAME({{"arg": "value"}})
+
+Do not use JSON function-calling, a <tool_call> tag, or any other structured tool-call format your training may default to.
+The ONLY format the system running you understands is the plain text line above.
+
+Available commands:
 
 {tool_list_repr}
 
-When you want to use a tool, reply with exactly one line in the format: 'tool: TOOL_NAME({{JSON_ARGS}})' and nothing else.
-Use compact single-line JSON with double quotes. After receiving a tool_result(...) message, continue the task.
-If no tool is needed, respond normally.
+Example of a correct response when you want to read a file named 'notes.txt':
+tool: read_file({{"filename": "notes.txt"}})
 
-IMPORTANT: do not use any native function calling / tool_calls mechanism of the API.
-The ONLY valid way to invoke a tool is writing a plain text line in the exact format
-above. Never fabricate or guess what a tool would return, always actually invoke it
-using that text format and wait for the real tool_result(...) message.
+Use compact single-line JSON with double quotes. After receiving a tool_result(...) message, continue the task using the same format when another action is needed.
+If no action is needed, respond in plain prose.
 """
 
 
@@ -202,17 +200,15 @@ def split_thought_and_tool_lines(text: str):
 
 def execute_llm_call(conversation: List[Dict[str, str]]):
     response = openai_client.chat.completions.create(
-        model="openai/gpt-oss-120b",
+        model="qwen/qwen3.8-27b",
         messages=conversation,
         max_tokens=2000
     )
     message = response.choices[0].message
-    # Descoberta empírica (ver ANALISE.md): a Groq devolve, pra esse modelo, um
-    # campo `reasoning` separado de `content` (canal de raciocínio interno vs.
-    # resposta final). O código original só lia `content`, só que boa parte das
-    # vezes é justamente em `reasoning` que o modelo escreve a linha
-    # "tool: nome({...})" pedida no prompt, deixando `content` vazio. Juntamos os
-    # dois pra não descartar texto que o modelo de fato gerou.
+    # Modelos de raciocínio servidos pela Groq podem devolver um campo `reasoning`
+    # separado de `content`. O código original só lia `content`, então juntamos os
+    # dois para não descartar texto que o modelo de fato gerou. Para modelos sem
+    # esse campo, o resultado é idêntico a ler só `content`.
     reasoning = getattr(message, "reasoning", None) or ""
     content = message.content or ""
     return (reasoning + ("\n" + content if content else "")).strip()
@@ -221,15 +217,13 @@ MAX_LLM_CALL_ATTEMPTS = 3
 
 def execute_llm_call_with_retry(conversation: List[Dict[str, str]]):
     """
-    Alguns modelos (ex.: openai/gpt-oss-120b via Groq) tentam responder usando o
-    canal de tool calling nativo da API mesmo quando instruídos, só via prompt, a
-    responder em texto puro, e a API rejeita isso com um erro 400 antes de
-    qualquer texto voltar pra gente. Isso não é uma falha do nosso parser (o texto
-    nem chega a existir), então não tem "tool: ..." pra extract_tool_invocations
-    processar. Aqui só evitamos que isso derrube o programa inteiro com um
-    traceback ilegível: tentamos de novo (a amostragem é probabilística) e, se
-    todas as tentativas falharem, devolvemos None para o chamador decidir como
-    encerrar. Toda tentativa falha é logada no trace, nada fica escondido.
+    Modelos pós-treinados para tool calling nativo podem tentar responder pelo canal
+    nativo da API, e a API pode rejeitar isso com um erro 400 antes de qualquer
+    texto voltar. Isso não é uma falha de extract_tool_invocations (o texto nem
+    chega a existir). Aqui só evitamos que isso derrube o programa com um traceback
+    ilegível: tentamos de novo (a amostragem é probabilística) e, se todas as
+    tentativas falharem, devolvemos None para o chamador decidir como encerrar.
+    Toda tentativa falha é logada no trace, nada fica escondido.
     """
     last_error = None
     for attempt in range(1, MAX_LLM_CALL_ATTEMPTS + 1):

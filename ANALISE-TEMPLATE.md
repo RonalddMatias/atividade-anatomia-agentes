@@ -48,7 +48,7 @@ call) e o que faria o laço parar (resposta sem nenhuma tool call). -->
 volta para a `conversation` e passa a ser lido pelo LLM na chamada seguinte. Comente
 também o que NÃO volta para o contexto (ex.: o raciocínio do modelo antes de uma tool
 call, quando a resposta tem tool call, nunca é appendado à `conversation` no código
-atual — isso é uma limitação de contexto, não um bug do seu log). -->
+atual, isso é uma limitação de contexto, não um bug do seu log). -->
 
 ## 3. Tools / ACI
 
@@ -69,12 +69,12 @@ bruto do modelo, só o resultado da ação). -->
 <!-- O item mais importante. O agente não roda o teste nem verifica se o problema foi
 resolvido antes de parar. Baseado na sua execução real: o agente rodou pytest por
 conta própria? Ele parou achando que tinha terminado sem de fato ter confirmado isso?
-O que aconteceria se a "correção" dele estivesse errada — ele perceberia? -->
+O que aconteceria se a "correção" dele estivesse errada, ele perceberia? -->
 
 ## 6. Falhas de parsing
 
 <!-- O que o parser (extract_tool_invocations) errou ou deixou passar na sua execução?
 Se seu trace.md registrou algum aviso "[PARSING]", cole o trecho aqui e explique o que
-aconteceu. Se não houve nenhuma falha, diga isso explicitamente — também é um dado
+aconteceu. Se não houve nenhuma falha, diga isso explicitamente, também é um dado
 relevante (modelos gratuitos seguem o formato com menos consistência, então a ausência
 de falha em uma execução não garante que ela não aconteça em outra). -->
